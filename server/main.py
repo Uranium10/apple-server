@@ -1,9 +1,51 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict
+import os
 import json
+import asyncio
+from typing import Dict, List, Optional
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.middleware.cors import CORSMiddleware
+from sse_starlette.sse import EventSourceResponse
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import libsql_client
 
-app = FastAPI()
+load_dotenv()
+
+from contextlib import asynccontextmanager
+
+# --- Database & Leaderboard ---
+TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "file:local.db")
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
+
+db_client = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global db_client
+    db_client = libsql_client.create_client(
+        url=TURSO_DATABASE_URL,
+        auth_token=TURSO_AUTH_TOKEN
+    )
+    
+    # Initialize DB
+    tables = ["apple_1p", "apple_2p", "apple_3p", "apple_4p"]
+    for t in tables:
+        try:
+            await db_client.execute(f"""
+                CREATE TABLE IF NOT EXISTS {t} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    player_names TEXT NOT NULL,
+                    score INTEGER NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        except Exception as e:
+            print(f"Error initializing DB table {t}: {e}")
+    print("DB initialized successfully (async)")
+    yield
+    await db_client.close()
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -13,6 +55,103 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class LeaderboardEntry(BaseModel):
+    playerCount: int
+    playerNames: List[str]
+    score: int
+
+# SSE Clients
+leaderboard_clients: list[asyncio.Queue] = []
+
+async def fetch_all_leaderboards() -> dict:
+    """Asynchronously fetch all leaderboard data from DB."""
+    data = {}
+    tables = [("1p", "apple_1p"), ("2p", "apple_2p"), ("3p", "apple_3p"), ("4p", "apple_4p")]
+    for key, table in tables:
+        try:
+            res = await db_client.execute(f"SELECT player_names, score, created_at FROM {table} ORDER BY score DESC, created_at ASC LIMIT 20")
+            data[key] = [{"playerNames": row[0], "score": row[1], "date": str(row[2]) if row[2] else ""} for row in res.rows]
+        except Exception as e:
+            data[key] = []
+            print(f"Error fetching {table}: {e}")
+    return data
+
+async def notify_leaderboard_update():
+    """Push updated leaderboard data to all connected SSE clients."""
+    data = await fetch_all_leaderboards()
+    message = json.dumps(data)
+    for client_queue in leaderboard_clients:
+        await client_queue.put(message)
+
+@app.post("/api/leaderboard")
+async def post_leaderboard(entry: LeaderboardEntry):
+    if entry.playerCount < 1 or entry.playerCount > 4:
+        return {"error": "Invalid player count"}
+        
+    table_name = f"apple_{entry.playerCount}p"
+    names_str = ", ".join(entry.playerNames)
+    score = entry.score
+    
+    print(f"[Leaderboard] Received: table={table_name}, names={names_str}, score={score}")
+    
+    try:
+        # Check if it makes it to top 20
+        res = await db_client.execute(f"SELECT score FROM {table_name} ORDER BY score DESC LIMIT 20")
+        rows = res.rows
+        
+        if len(rows) < 20 or score > rows[-1][0]:
+            # Insert with list-style args (libsql_client requirement)
+            await db_client.execute(
+                f"INSERT INTO {table_name} (player_names, score) VALUES (?, ?)", 
+                [names_str, score]
+            )
+            # Delete below top 20
+            await db_client.execute(f"""
+                DELETE FROM {table_name} 
+                WHERE id NOT IN (
+                    SELECT id FROM {table_name} ORDER BY score DESC, created_at ASC LIMIT 20
+                )
+            """)
+            print(f"[Leaderboard] Inserted into {table_name}: {names_str} = {score}")
+            await notify_leaderboard_update()
+            return {"success": True, "message": "Leaderboard updated"}
+        else:
+            print(f"[Leaderboard] Score {score} not high enough for {table_name} (min top20: {rows[-1][0]})")
+            return {"success": True, "message": "Score not high enough"}
+    except Exception as e:
+        print(f"[Leaderboard] Error: {e}")
+        return {"error": str(e)}
+
+@app.get("/api/leaderboard/stream")
+async def leaderboard_stream(request: Request):
+    queue = asyncio.Queue()
+    leaderboard_clients.append(queue)
+    
+    # Pre-load initial data into queue before starting generator
+    initial_data = await fetch_all_leaderboards()
+    await queue.put(json.dumps(initial_data))
+    
+    async def event_generator():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=30)
+                    yield {"data": data}
+                except asyncio.TimeoutError:
+                    # Send keepalive comment to prevent connection timeout
+                    yield {"comment": "keepalive"}
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if queue in leaderboard_clients:
+                leaderboard_clients.remove(queue)
+            
+    return EventSourceResponse(event_generator())
+
+
+# --- Room & WebRTC Signaling ---
 class RoomManager:
     def __init__(self):
         # room_id -> { client_id: WebSocket }
