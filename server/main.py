@@ -20,9 +20,13 @@ class RoomManager:
         # room_id -> { client_id: client_name }
         self.names: Dict[str, Dict[str, str]] = {}
 
-    async def connect(self, room_id: str, client_id: str, client_name: str, websocket: WebSocket):
+    async def connect(self, room_id: str, client_id: str, client_name: str, websocket: WebSocket, is_host: bool = False):
         await websocket.accept()
-        if room_id in self.rooms and len(self.rooms[room_id]) >= 4:
+        if room_id != "lobby" and not is_host and room_id not in self.rooms:
+            await websocket.send_json({"type": "room-not-found"})
+            await websocket.close()
+            return False
+        if room_id != "lobby" and room_id in self.rooms and len(self.rooms[room_id]) >= 4:
             await websocket.send_json({"type": "room-full"})
             await websocket.close()
             return False
@@ -77,8 +81,9 @@ class RoomManager:
 manager = RoomManager()
 
 @app.websocket("/ws/{room_id}/{client_id}")
-async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str, name: str = "Unknown"):
-    success = await manager.connect(room_id, client_id, name, websocket)
+async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str, name: str = "Unknown", isHost: str = "false"):
+    is_host_bool = isHost.lower() == "true"
+    success = await manager.connect(room_id, client_id, name, websocket, is_host_bool)
     if success is False:
         return
     try:
@@ -105,6 +110,23 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str,
                     "senderName": manager.names[room_id].get(client_id, "Unknown"),
                     "text": message.get("text")
                 })
+                continue
+
+            if msg_type == "player-ready":
+                await manager.broadcast_to_room(room_id, {
+                    "type": "player-ready",
+                    "clientId": client_id,
+                    "isReady": message.get("isReady", False)
+                }, exclude=client_id)
+                continue
+
+            if msg_type == "room-chat":
+                await manager.broadcast_to_room(room_id, {
+                    "type": "room-chat",
+                    "clientId": client_id,
+                    "senderName": manager.names[room_id].get(client_id, "Unknown"),
+                    "text": message.get("text")
+                }, exclude=client_id)
                 continue
             
             # Signaling for WebRTC
