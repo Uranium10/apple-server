@@ -158,17 +158,24 @@ class RoomManager:
         self.rooms: Dict[str, Dict[str, WebSocket]] = {}
         # room_id -> { client_id: client_name }
         self.names: Dict[str, Dict[str, str]] = {}
+        # room_id -> game_mode ("coop" or "comp")
+        self.room_modes: Dict[str, str] = {}
 
-    async def connect(self, room_id: str, client_id: str, client_name: str, websocket: WebSocket, is_host: bool = False):
+    async def connect(self, room_id: str, client_id: str, client_name: str, websocket: WebSocket, is_host: bool = False, game_mode: str = "coop"):
         await websocket.accept()
+        if is_host:
+            self.room_modes[room_id] = game_mode
         if room_id != "lobby" and not is_host and room_id not in self.rooms:
             await websocket.send_json({"type": "room-not-found"})
             await websocket.close()
             return False
-        if room_id != "lobby" and room_id in self.rooms and len(self.rooms[room_id]) >= 8:
-            await websocket.send_json({"type": "room-full"})
-            await websocket.close()
-            return False
+        if room_id != "lobby" and room_id in self.rooms:
+            current_mode = self.room_modes.get(room_id, "coop")
+            limit = 8 if current_mode == "comp" else 4
+            if len(self.rooms[room_id]) >= limit:
+                await websocket.send_json({"type": "room-full"})
+                await websocket.close()
+                return False
             
         if room_id not in self.rooms:
             self.rooms[room_id] = {}
@@ -203,6 +210,8 @@ class RoomManager:
             if not self.rooms[room_id]:
                 del self.rooms[room_id]
                 del self.names[room_id]
+                if room_id in self.room_modes:
+                    del self.room_modes[room_id]
             else:
                 return True # Room still has players
         return False
@@ -220,9 +229,9 @@ class RoomManager:
 manager = RoomManager()
 
 @app.websocket("/ws/{room_id}/{client_id}")
-async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str, name: str = "Unknown", isHost: str = "false"):
+async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str, name: str = "Unknown", isHost: str = "false", gameMode: str = "coop"):
     is_host_bool = isHost.lower() == "true"
-    success = await manager.connect(room_id, client_id, name, websocket, is_host_bool)
+    success = await manager.connect(room_id, client_id, name, websocket, is_host_bool, gameMode)
     if success is False:
         return
     try:
@@ -242,6 +251,11 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str,
                     })
                 continue
                 
+            if msg_type == "set-game-mode":
+                mode = message.get("mode", "coop")
+                manager.room_modes[room_id] = mode
+                continue
+
             if msg_type == "lobby-chat":
                 await manager.broadcast_to_room(room_id, {
                     "type": "lobby-chat",
