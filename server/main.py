@@ -165,7 +165,7 @@ class RoomManager:
             await websocket.send_json({"type": "room-not-found"})
             await websocket.close()
             return False
-        if room_id != "lobby" and room_id in self.rooms and len(self.rooms[room_id]) >= 4:
+        if room_id != "lobby" and room_id in self.rooms and len(self.rooms[room_id]) >= 8:
             await websocket.send_json({"type": "room-full"})
             await websocket.close()
             return False
