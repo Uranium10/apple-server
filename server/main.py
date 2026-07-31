@@ -34,6 +34,19 @@ def run_query(sql: str, params: tuple = ()):
     finally:
         conn.close()
 
+def run_transaction_queries(queries: list):
+    """Executes multiple queries in a single connection and commits at the end."""
+    conn = libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+    try:
+        for sql, params in queries:
+            if params:
+                conn.execute(sql, params)
+            else:
+                conn.execute(sql)
+        conn.commit()
+    finally:
+        conn.close()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Initialize DB
@@ -108,18 +121,13 @@ async def post_leaderboard(entry: LeaderboardEntry):
         rows = await asyncio.to_thread(run_query, f"SELECT score FROM {table_name} ORDER BY score DESC LIMIT 20")
         
         if len(rows) < 20 or score > rows[-1][0]:
-            # Insert with tuple-style args
-            await asyncio.to_thread(run_query,
-                f"INSERT INTO {table_name} (player_names, score) VALUES (?, ?)", 
-                (names_str, score)
-            )
-            # Delete below top 20
-            await asyncio.to_thread(run_query, f"""
-                DELETE FROM {table_name} 
-                WHERE id NOT IN (
-                    SELECT id FROM {table_name} ORDER BY score DESC, created_at ASC LIMIT 20
-                )
-            """)
+            # Insert and Delete in a single connection to avoid race conditions
+            queries = [
+                (f"INSERT INTO {table_name} (player_names, score) VALUES (?, ?)", (names_str, score)),
+                (f"DELETE FROM {table_name} WHERE id NOT IN (SELECT id FROM {table_name} ORDER BY score DESC, created_at ASC LIMIT 20)", ())
+            ]
+            await asyncio.to_thread(run_transaction_queries, queries)
+            
             print(f"[Leaderboard] Inserted into {table_name}: {names_str} = {score}")
             await notify_leaderboard_update()
             return {"success": True, "message": "Leaderboard updated"}
