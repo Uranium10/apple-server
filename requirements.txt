@@ -3,5 +3,5 @@ uvicorn
 sse-starlette
 pydantic
 python-dotenv
-libsql-client
+libsql
 httpx
