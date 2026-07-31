@@ -21,23 +21,27 @@ from contextlib import asynccontextmanager
 TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "file:local.db")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
 
-db_client = None
+def run_query(sql: str, params: tuple = ()):
+    conn = libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+    try:
+        if params:
+            cursor = conn.execute(sql, params)
+        else:
+            cursor = conn.execute(sql)
+        rows = cursor.fetchall()
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db_client
-    # Connect using new libsql sync API
-    db_client = libsql.connect(
-        database=TURSO_DATABASE_URL,
-        auth_token=TURSO_AUTH_TOKEN
-    )
-    
     # Initialize DB
     tables = ["apple_1p", "apple_2p", "apple_3p", "apple_4p"]
     for t in tables:
         try:
             # Wrap synchronous execute in asyncio.to_thread to prevent event loop blocking
-            await asyncio.to_thread(db_client.execute, f"""
+            await asyncio.to_thread(run_query, f"""
                 CREATE TABLE IF NOT EXISTS {t} (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     player_names TEXT NOT NULL,
@@ -49,7 +53,6 @@ async def lifespan(app: FastAPI):
             print(f"Error initializing DB table {t}: {e}")
     print("DB initialized successfully")
     yield
-    db_client.close()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -75,8 +78,7 @@ async def fetch_all_leaderboards() -> dict:
     tables = [("1p", "apple_1p"), ("2p", "apple_2p"), ("3p", "apple_3p"), ("4p", "apple_4p")]
     for key, table in tables:
         try:
-            cursor = await asyncio.to_thread(db_client.execute, f"SELECT player_names, score, created_at FROM {table} ORDER BY score DESC, created_at ASC LIMIT 20")
-            rows = cursor.fetchall()
+            rows = await asyncio.to_thread(run_query, f"SELECT player_names, score, created_at FROM {table} ORDER BY score DESC, created_at ASC LIMIT 20")
             data[key] = [{"playerNames": row[0], "score": row[1], "date": str(row[2]) if row[2] else ""} for row in rows]
         except Exception as e:
             data[key] = []
@@ -103,17 +105,16 @@ async def post_leaderboard(entry: LeaderboardEntry):
     
     try:
         # Check if it makes it to top 20
-        cursor = await asyncio.to_thread(db_client.execute, f"SELECT score FROM {table_name} ORDER BY score DESC LIMIT 20")
-        rows = cursor.fetchall()
+        rows = await asyncio.to_thread(run_query, f"SELECT score FROM {table_name} ORDER BY score DESC LIMIT 20")
         
         if len(rows) < 20 or score > rows[-1][0]:
             # Insert with tuple-style args
-            await asyncio.to_thread(db_client.execute,
+            await asyncio.to_thread(run_query,
                 f"INSERT INTO {table_name} (player_names, score) VALUES (?, ?)", 
                 (names_str, score)
             )
             # Delete below top 20
-            await asyncio.to_thread(db_client.execute, f"""
+            await asyncio.to_thread(run_query, f"""
                 DELETE FROM {table_name} 
                 WHERE id NOT IN (
                     SELECT id FROM {table_name} ORDER BY score DESC, created_at ASC LIMIT 20
