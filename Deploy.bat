@@ -1,0 +1,2 @@
+call fly deploy
+pause

@@ -4,3 +4,4 @@ sse-starlette
 pydantic
 python-dotenv
 libsql-client
+httpx

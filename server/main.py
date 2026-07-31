@@ -6,10 +6,14 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
+import httpx
 from dotenv import load_dotenv
 import libsql_client
 
 load_dotenv()
+
+CF_TURN_KEY_ID = os.getenv("CF_TURN_KEY_ID", "")
+CF_TURN_API_TOKEN = os.getenv("CF_TURN_API_TOKEN", "")
 
 from contextlib import asynccontextmanager
 
@@ -149,6 +153,32 @@ async def leaderboard_stream(request: Request):
                 leaderboard_clients.remove(queue)
             
     return EventSourceResponse(event_generator())
+
+
+@app.get("/api/turn-credentials")
+async def get_turn_credentials():
+    fallback = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    if not CF_TURN_KEY_ID or not CF_TURN_API_TOKEN:
+        return fallback
+
+    url = f"https://rtc.live.cloudflare.com/v1/turn/keys/{CF_TURN_KEY_ID}/credentials/generate-ice-servers"
+    headers = {
+        "Authorization": f"Bearer {CF_TURN_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {"ttl": 86400}
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=payload, timeout=5.0)
+            if response.status_code == 201:
+                return response.json()
+            else:
+                print(f"[TURN] Failed to generate credentials: {response.status_code} {response.text}")
+                return fallback
+    except Exception as e:
+        print(f"[TURN] Error connecting to Cloudflare: {e}")
+        return fallback
 
 
 # --- Room & WebRTC Signaling ---
